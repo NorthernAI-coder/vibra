@@ -2,7 +2,7 @@ name: EclipseCam APK
 
 on:
   push:
-    branches: [chatgpt/eclipse-apk-build]
+    branches: [chatgpt/eclipse-apk-build, "claude/**"]
   workflow_dispatch:
 
 jobs:

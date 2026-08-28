@@ -6,19 +6,28 @@ plugins {
 android {
     namespace = "com.northernai.eclipsecam"
     compileSdk = 35
+
     defaultConfig {
         applicationId = "com.northernai.eclipsecam"
-        minSdk = 28
+        minSdk = 29
         targetSdk = 35
         versionCode = 1
         versionName = "1.0-field"
     }
-    buildTypes { release { isMinifyEnabled = false } }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions { jvmTarget = "17" }
+    kotlinOptions {
+        jvmTarget = "17"
+    }
 }
 
 dependencies {
