@@ -13,7 +13,7 @@ import android.os.Looper
 import android.provider.MediaStore
 import android.view.Gravity
 import android.view.MotionEvent
-import android.view.ViewGroup
+import android.view.ScaleGestureDetector
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
@@ -42,13 +42,18 @@ class MainActivity : ComponentActivity() {
     private lateinit var preview: PreviewView
     private lateinit var status: TextView
     private lateinit var rawBadge: TextView
+    private lateinit var focusBadge: TextView
     private lateinit var evLabel: TextView
+    private lateinit var zoomLabel: TextView
+    private lateinit var zoomSeek: SeekBar
     private lateinit var shutter: Button
     private lateinit var bracket: Button
     private lateinit var timer: Button
     private lateinit var zoom1: Button
     private lateinit var zoom2: Button
     private lateinit var zoom4: Button
+    private lateinit var zoom6: Button
+    private lateinit var zoomMaxButton: Button
 
     private var provider: ProcessCameraProvider? = null
     private var camera: Camera? = null
@@ -59,6 +64,8 @@ class MainActivity : ComponentActivity() {
     private var timerSeconds = 2
     private var baseEv = -1.5f
     private var zoomRatio = 2f
+    private var maxZoomRatio = 1f
+    private var pinchActive = false
     private val handler = Handler(Looper.getMainLooper())
 
     private val permissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
@@ -109,31 +116,61 @@ class MainActivity : ComponentActivity() {
         val titleBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         titleRow.addView(titleBox, LinearLayout.LayoutParams(0, -2, 1f))
         titleBox.addView(label("EclipseCam", 23f, Color.WHITE, true))
-        titleBox.addView(label("LUNAR ECLIPSE • FIELD MODE", 11f, GOLD, true))
+        titleBox.addView(label("LUNAR ECLIPSE • SHARPNESS MODE", 11f, GOLD, true))
         rawBadge = label("RAW CHECK…", 11f, MUTED, true).apply {
-            setPadding(dp(10), dp(6), dp(10), dp(6))
+            setPadding(dp(9), dp(6), dp(9), dp(6))
             setBackgroundColor(PANEL)
         }
         titleRow.addView(rawBadge)
-        status = label("Starting camera…", 12f, MUTED, false).apply { setPadding(0, dp(7), 0, 0) }
+        focusBadge = label("FOCUS: TAP", 10f, GOLD, true).apply {
+            setPadding(dp(9), dp(5), dp(9), dp(5))
+            setBackgroundColor(PANEL)
+        }
+        top.addView(focusBadge, LinearLayout.LayoutParams(-2, -2))
+        status = label("Starting camera…", 12f, MUTED, false).apply { setPadding(0, dp(6), 0, 0) }
         top.addView(status)
 
         val bottom = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(8), dp(12), dp(12))
+            setPadding(dp(12), dp(7), dp(12), dp(12))
             setBackgroundColor(Color.argb(235, 7, 11, 16))
         }
         root.addView(bottom, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
 
-        val row1 = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-        bottom.addView(row1, LinearLayout.LayoutParams(-1, -2))
-        val zooms = LinearLayout(this)
-        row1.addView(zooms, LinearLayout.LayoutParams(0, -2, 1f))
+        val zoomButtonRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        bottom.addView(zoomButtonRow, LinearLayout.LayoutParams(-1, -2))
         zoom1 = smallButton("1×") { setZoom(1f) }
         zoom2 = smallButton("2×") { setZoom(2f) }
         zoom4 = smallButton("4×") { setZoom(4f) }
-        zooms.addView(zoom1); zooms.addView(zoom2); zooms.addView(zoom4)
+        zoom6 = smallButton("6×") { setZoom(6f) }
+        zoomMaxButton = smallButton("MAX") { setZoom(maxZoomRatio) }
+        zoomButtonRow.addView(zoom1)
+        zoomButtonRow.addView(zoom2)
+        zoomButtonRow.addView(zoom4)
+        zoomButtonRow.addView(zoom6)
+        zoomButtonRow.addView(zoomMaxButton)
+        zoomLabel = label("2.0×", 12f, Color.WHITE, true).apply { gravity = Gravity.END }
+        zoomButtonRow.addView(zoomLabel, LinearLayout.LayoutParams(0, -2, 1f))
 
+        val zoomSliderRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        bottom.addView(zoomSliderRow, LinearLayout.LayoutParams(-1, -2))
+        zoomSliderRow.addView(label("ZOOM", 11f, GOLD, true))
+        zoomSeek = SeekBar(this).apply {
+            max = 1000
+            progress = 0
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                    if (fromUser && !busy) setZoom(progressToZoom(progress))
+                }
+                override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+                override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
+            })
+        }
+        zoomSliderRow.addView(zoomSeek, LinearLayout.LayoutParams(0, dp(38), 1f))
+        zoomSliderRow.addView(label("PINCH", 10f, MUTED, true))
+
+        val modeRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        bottom.addView(modeRow, LinearLayout.LayoutParams(-1, -2))
         bracket = smallButton("BRACKET 3") {
             if (busy) return@smallButton
             bracketOn = !bracketOn
@@ -142,13 +179,16 @@ class MainActivity : ComponentActivity() {
             status.text = if (bracketOn) "3 exposures protect Moon + bright sign" else "Single exposure"
         }
         styleToggle(bracket, true)
-        row1.addView(bracket)
+        modeRow.addView(bracket)
         timer = smallButton("2s") {
             if (busy) return@smallButton
             timerSeconds = if (timerSeconds == 2) 0 else 2
             timer.text = "${timerSeconds}s"
         }
-        row1.addView(timer)
+        modeRow.addView(timer)
+        modeRow.addView(label("MAX QUALITY • TAP TO LOCK FOCUS", 10f, GREEN, true).apply {
+            gravity = Gravity.END
+        }, LinearLayout.LayoutParams(0, -2, 1f))
 
         val evRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         bottom.addView(evRow, LinearLayout.LayoutParams(-1, -2))
@@ -169,16 +209,16 @@ class MainActivity : ComponentActivity() {
         evRow.addView(seek, LinearLayout.LayoutParams(0, dp(42), 1f))
         evLabel = label(formatEv(baseEv), 13f, Color.WHITE, true).apply { gravity = Gravity.END }
         evRow.addView(evLabel, LinearLayout.LayoutParams(dp(58), -2))
-        bottom.addView(label("Default: −3.0 • −1.5 • 0.0 EV", 11f, MUTED, false).apply { gravity = Gravity.CENTER })
+        bottom.addView(label("Bracket: −3.0 • −1.5 • 0.0 EV • 2s anti-shake timer", 10f, MUTED, false).apply { gravity = Gravity.CENTER })
 
         val shutterRow = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(6), 0, 0)
+            setPadding(0, dp(4), 0, 0)
         }
         bottom.addView(shutterRow, LinearLayout.LayoutParams(-1, -2))
         val left = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        left.addView(label("ECLIPSE SAFE", 11f, GREEN, true))
-        left.addView(label("Tap lit sign/building first", 10f, MUTED, false))
+        left.addView(label("SHARPNESS FIRST", 11f, GREEN, true))
+        left.addView(label("Tap distant sign / Moon edge", 10f, MUTED, false))
         shutterRow.addView(left, LinearLayout.LayoutParams(0, -2, 1f))
         shutter = Button(this).apply {
             text = "●"
@@ -187,14 +227,33 @@ class MainActivity : ComponentActivity() {
             setBackgroundColor(Color.TRANSPARENT)
             setOnClickListener { beginCapture() }
         }
-        shutterRow.addView(shutter, LinearLayout.LayoutParams(dp(92), dp(78)))
+        shutterRow.addView(shutter, LinearLayout.LayoutParams(dp(92), dp(76)))
         val right = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.END }
         right.addView(label("FLASH OFF", 11f, GREEN, true).apply { gravity = Gravity.END })
-        right.addView(label("Brace phone / tripod", 10f, MUTED, false).apply { gravity = Gravity.END })
+        right.addView(label("4× optical preferred", 10f, MUTED, false).apply { gravity = Gravity.END })
         shutterRow.addView(right, LinearLayout.LayoutParams(0, -2, 1f))
 
+        val scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
+                pinchActive = true
+                return true
+            }
+
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                if (!busy) setZoom(zoomRatio * detector.scaleFactor)
+                return true
+            }
+
+            override fun onScaleEnd(detector: ScaleGestureDetector) {
+                handler.postDelayed({ pinchActive = false }, 120)
+            }
+        })
+
         preview.setOnTouchListener { _, event ->
-            if (event.action == MotionEvent.ACTION_UP && !busy) tapMeter(event.x, event.y)
+            scaleDetector.onTouchEvent(event)
+            if (event.action == MotionEvent.ACTION_UP && !busy && !pinchActive) {
+                tapMeter(event.x, event.y)
+            }
             true
         }
         refreshZoomButtons()
@@ -246,12 +305,19 @@ class MainActivity : ComponentActivity() {
         capture = ic
         rawBadge.text = if (rawJpeg) "RAW + JPEG ✓" else "JPEG"
         rawBadge.setTextColor(if (rawJpeg) GREEN else MUTED)
-        val maxZoom = bound.cameraInfo.zoomState.value?.maxZoomRatio ?: 1f
-        zoom2.isEnabled = maxZoom >= 1.9f
-        zoom4.isEnabled = maxZoom >= 3.9f
-        setZoom(if (maxZoom >= 1.9f) 2f else 1f)
+        maxZoomRatio = (bound.cameraInfo.zoomState.value?.maxZoomRatio ?: 1f).coerceAtLeast(1f)
+        zoom2.isEnabled = maxZoomRatio >= 1.9f
+        zoom4.isEnabled = maxZoomRatio >= 3.9f
+        zoom6.isEnabled = maxZoomRatio >= 5.9f
+        zoomMaxButton.isEnabled = maxZoomRatio > 1.1f
+        zoomMaxButton.text = if (maxZoomRatio >= 9.5f) "MAX" else "${formatZoom(maxZoomRatio)}×"
+        setZoom(if (maxZoomRatio >= 3.9f) 4f else if (maxZoomRatio >= 1.9f) 2f else 1f)
         setEv(bound, baseEv)
-        status.text = if (rawJpeg) "Ready • RAW+JPEG • tap distant lit sign/building" else "Ready • JPEG bracket • tap distant lit sign/building"
+        status.text = if (rawJpeg) {
+            "Ready • MAX QUALITY • RAW+JPEG • pinch zoom or tap 4×"
+        } else {
+            "Ready • MAX QUALITY • JPEG bracket • pinch zoom or tap 4×"
+        }
     }
 
     private fun tapMeter(x: Float, y: Float) {
@@ -259,25 +325,67 @@ class MainActivity : ComponentActivity() {
         val point = preview.meteringPointFactory.createPoint(x, y)
         val flags = FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE or FocusMeteringAction.FLAG_AWB
         val action = FocusMeteringAction.Builder(point, flags)
-            .setAutoCancelDuration(8, TimeUnit.SECONDS)
+            .setAutoCancelDuration(30, TimeUnit.SECONDS)
             .build()
-        c.cameraControl.startFocusAndMetering(action)
-        status.text = "Focus + exposure metering set • shoot within 8 sec"
+        focusBadge.text = "FOCUSING…"
+        focusBadge.setTextColor(GOLD)
+        val result = c.cameraControl.startFocusAndMetering(action)
+        result.addListener({
+            runCatching { result.get() }.onSuccess { focusResult ->
+                if (focusResult.isFocusSuccessful) {
+                    focusBadge.text = "FOCUS ✓ 30s"
+                    focusBadge.setTextColor(GREEN)
+                    status.text = "Sharp focus + metering locked • capture now"
+                } else {
+                    focusBadge.text = "FOCUS: RETAP"
+                    focusBadge.setTextColor(GOLD)
+                    status.text = "Focus uncertain • tap a crisp distant edge again"
+                }
+            }.onFailure {
+                focusBadge.text = "FOCUS: RETAP"
+                focusBadge.setTextColor(GOLD)
+            }
+        }, ContextCompat.getMainExecutor(this))
     }
 
     private fun setZoom(requested: Float) {
-        val c = camera ?: run { zoomRatio = requested; refreshZoomButtons(); return }
-        val max = c.cameraInfo.zoomState.value?.maxZoomRatio ?: 1f
-        zoomRatio = requested.coerceIn(1f, max)
+        val c = camera ?: run {
+            zoomRatio = requested.coerceAtLeast(1f)
+            refreshZoomButtons()
+            return
+        }
+        maxZoomRatio = (c.cameraInfo.zoomState.value?.maxZoomRatio ?: maxZoomRatio).coerceAtLeast(1f)
+        zoomRatio = requested.coerceIn(1f, maxZoomRatio)
         c.cameraControl.setZoomRatio(zoomRatio)
         refreshZoomButtons()
-        status.text = if (zoomRatio >= 3.5f) "4× Moon detail" else if (zoomRatio >= 1.5f) "2× Moon + foreground" else "1× wide scene"
+        zoomLabel.text = "${formatZoom(zoomRatio)}× / ${formatZoom(maxZoomRatio)}×"
+        val targetProgress = zoomToProgress(zoomRatio)
+        if (zoomSeek.progress != targetProgress) zoomSeek.progress = targetProgress
+        status.text = when {
+            zoomRatio > 6f -> "${formatZoom(zoomRatio)}× digital detail • brace phone carefully"
+            zoomRatio >= 3.7f -> "${formatZoom(zoomRatio)}× Moon detail • Pixel telephoto range"
+            zoomRatio >= 1.5f -> "${formatZoom(zoomRatio)}× Moon + foreground"
+            else -> "1× wide scene"
+        }
+    }
+
+    private fun progressToZoom(progress: Int): Float {
+        if (maxZoomRatio <= 1f) return 1f
+        return 1f + (maxZoomRatio - 1f) * (progress.coerceIn(0, 1000) / 1000f)
+    }
+
+    private fun zoomToProgress(ratio: Float): Int {
+        if (maxZoomRatio <= 1f) return 0
+        return (((ratio - 1f) / (maxZoomRatio - 1f)) * 1000f).roundToInt().coerceIn(0, 1000)
     }
 
     private fun refreshZoomButtons() {
-        styleToggle(zoom1, abs(zoomRatio - 1f) < .35f)
+        if (!::zoom1.isInitialized) return
+        styleToggle(zoom1, abs(zoomRatio - 1f) < .25f)
         styleToggle(zoom2, abs(zoomRatio - 2f) < .35f)
-        styleToggle(zoom4, abs(zoomRatio - 4f) < .6f)
+        styleToggle(zoom4, abs(zoomRatio - 4f) < .55f)
+        styleToggle(zoom6, abs(zoomRatio - 6f) < .75f)
+        styleToggle(zoomMaxButton, maxZoomRatio > 1.1f && abs(zoomRatio - maxZoomRatio) < .45f)
     }
 
     private fun beginCapture() {
@@ -286,7 +394,7 @@ class MainActivity : ComponentActivity() {
         if (busy) return
         busy = true
         setControls(false)
-        status.text = if (timerSeconds == 2) "Hold still • 2-second timer…" else "Hold still • capturing…"
+        status.text = if (timerSeconds == 2) "Hold still • 2-second anti-shake timer…" else "Hold still • capturing…"
         val go = Runnable {
             if (bracketOn) {
                 val evs = listOf((baseEv - 1.5f).coerceAtLeast(-4f), baseEv, (baseEv + 1.5f).coerceAtMost(1f))
@@ -370,7 +478,7 @@ class MainActivity : ComponentActivity() {
         setControls(true)
         val exposures = if (bracketOn) 3 else 1
         val mode = if (rawJpeg) "RAW+JPEG" else "JPEG"
-        status.text = "Saved $exposures exposure${if (exposures == 1) "" else "s"} • $mode • Pictures/EclipseCam"
+        status.text = "Saved $exposures exposure${if (exposures == 1) "" else "s"} • $mode • ${formatZoom(zoomRatio)}×"
         Toast.makeText(this, "Saved ${uris.size} file${if (uris.size == 1) "" else "s"}", Toast.LENGTH_LONG).show()
     }
 
@@ -386,21 +494,25 @@ class MainActivity : ComponentActivity() {
         shutter.isEnabled = enabled
         bracket.isEnabled = enabled
         timer.isEnabled = enabled
+        zoomSeek.isEnabled = enabled
         zoom1.isEnabled = enabled
-        zoom2.isEnabled = enabled && ((camera?.cameraInfo?.zoomState?.value?.maxZoomRatio ?: 1f) >= 1.9f)
-        zoom4.isEnabled = enabled && ((camera?.cameraInfo?.zoomState?.value?.maxZoomRatio ?: 1f) >= 3.9f)
+        zoom2.isEnabled = enabled && maxZoomRatio >= 1.9f
+        zoom4.isEnabled = enabled && maxZoomRatio >= 3.9f
+        zoom6.isEnabled = enabled && maxZoomRatio >= 5.9f
+        zoomMaxButton.isEnabled = enabled && maxZoomRatio > 1.1f
     }
 
     private fun smallButton(text: String, click: () -> Unit) = Button(this).apply {
         this.text = text
-        textSize = 11f
+        textSize = 10f
         isAllCaps = false
         setTextColor(Color.WHITE)
         setBackgroundColor(PANEL)
-        minWidth = 0; minHeight = 0
-        setPadding(dp(9), dp(5), dp(9), dp(5))
+        minWidth = 0
+        minHeight = 0
+        setPadding(dp(8), dp(4), dp(8), dp(4))
         setOnClickListener { click() }
-        layoutParams = LinearLayout.LayoutParams(-2, dp(38)).apply { setMargins(dp(2), 0, dp(2), 0) }
+        layoutParams = LinearLayout.LayoutParams(-2, dp(36)).apply { setMargins(dp(2), 0, dp(2), 0) }
     }
 
     private fun styleToggle(button: Button, active: Boolean) {
@@ -409,11 +521,14 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun label(value: String, size: Float, color: Int, bold: Boolean) = TextView(this).apply {
-        text = value; textSize = size; setTextColor(color)
+        text = value
+        textSize = size
+        setTextColor(color)
         if (bold) setTypeface(typeface, Typeface.BOLD)
     }
 
     private fun formatEv(ev: Float) = if (ev > 0) "+%.1f".format(Locale.US, ev) else "%.1f".format(Locale.US, ev)
+    private fun formatZoom(z: Float) = if (abs(z - z.roundToInt()) < .05f) z.roundToInt().toString() else "%.1f".format(Locale.US, z)
     private fun evTag(ev: Float) = "EV_${if (ev < 0) "m" else if (ev > 0) "p" else "z"}${"%.1f".format(Locale.US, abs(ev)).replace('.', '_')}"
     private fun dp(v: Int) = (v * resources.displayMetrics.density).roundToInt()
 
