@@ -2,35 +2,35 @@ package com.northernai.eclipsecam
 
 import android.Manifest
 import android.content.ContentValues
+import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.Typeface
-import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CameraMetadata
-import android.hardware.camera2.CaptureRequest
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
+import android.util.Size
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
+import android.view.View
 import android.view.ViewConfiguration
 import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.camera.camera2.interop.Camera2CameraControl
-import androidx.camera.camera2.interop.Camera2CameraInfo
-import androidx.camera.camera2.interop.CaptureRequestOptions
-import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
-import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageCapture
@@ -39,6 +39,9 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
+import com.google.android.gms.auth.api.identity.Identity
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -49,43 +52,50 @@ import kotlin.math.ln
 import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
+
+    private data class Shot(val uri: Uri, val name: String, val mime: String)
+
     private lateinit var preview: PreviewView
+    private lateinit var grid: GridOverlay
     private lateinit var status: TextView
-    private lateinit var rawBadge: TextView
+    private lateinit var driveBadge: TextView
     private lateinit var focusBadge: TextView
     private lateinit var evLabel: TextView
-    private lateinit var bracketLabel: TextView
     private lateinit var zoomLabel: TextView
     private lateinit var zoomSeek: SeekBar
+    private lateinit var thumbnail: ImageView
     private lateinit var shutter: Button
-    private lateinit var bracket: Button
-    private lateinit var timer: Button
-    private lateinit var farFocus: Button
+    private lateinit var flipButton: Button
+    private lateinit var flashButton: Button
+    private lateinit var timerButton: Button
+    private lateinit var gridButton: Button
+    private lateinit var rawButton: Button
+    private lateinit var driveButton: Button
     private lateinit var zoom1: Button
     private lateinit var zoom2: Button
-    private lateinit var zoom4: Button
-    private lateinit var zoom6: Button
     private lateinit var zoomMaxButton: Button
 
     private var provider: ProcessCameraProvider? = null
     private var camera: Camera? = null
     private var capture: ImageCapture? = null
     private var starting = false
-    private var rawJpeg = false
-    private var rawProven = false
+
+    private var lensBack = true
+    private var flashMode = ImageCapture.FLASH_MODE_OFF
+    private var timerSeconds = 0
+    private var gridOn = false
+    private var rawWanted = false
+    private var rawAvailable = false
+    private var rawActive = false
+    private var autoUpload = true
+    private var driveConnected = false
+
     private var busy = false
-    private var bracketOn = true
-    private var timerSeconds = 2
-    private var baseEv = -1.5f
-    private var zoomRatio = 2f
+    private var baseEv = 0f
+    private var zoomRatio = 1f
     private var maxZoomRatio = 1f
     private var focusLocked = false
-    private var farFocusSupported = false
-    private var farFocusOn = false
 
-    // Every scheduled capture stage carries the token it was created under. Cancelling a
-    // sequence bumps the token, so late CameraX callbacks and pending Runnables become no-ops
-    // instead of resuming a sequence that no longer exists.
     private var captureToken = 0
     private var watchdog: Runnable? = null
 
@@ -96,6 +106,9 @@ class MainActivity : ComponentActivity() {
     private var gestureMaxPointers = 0
 
     private val handler = Handler(Looper.getMainLooper())
+    private val prefs by lazy { getSharedPreferences("camera", Context.MODE_PRIVATE) }
+
+    private lateinit var authLauncher: ActivityResultLauncher<IntentSenderRequest>
 
     private val permissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         if (requiredPermissions().all(::hasPermission)) startCamera()
@@ -106,21 +119,39 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         window.statusBarColor = Color.BLACK
         window.navigationBarColor = Color.BLACK
+
+        autoUpload = prefs.getBoolean(PREF_AUTO_UPLOAD, true)
+        rawWanted = prefs.getBoolean(PREF_RAW, false)
+        gridOn = prefs.getBoolean(PREF_GRID, false)
+        timerSeconds = prefs.getInt(PREF_TIMER, 0)
+        flashMode = prefs.getInt(PREF_FLASH, ImageCapture.FLASH_MODE_OFF)
+
+        authLauncher = registerForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
+            val granted = runCatching {
+                Identity.getAuthorizationClient(this)
+                    .getAuthorizationResultFromIntent(result.data)
+            }.getOrNull()?.accessToken != null
+            setDriveConnected(granted)
+            status.text = if (granted) {
+                "Google Drive connected • new photos upload to Drive/${Drive.FOLDER_NAME}"
+            } else {
+                "Google Drive not connected • photos still save to the phone"
+            }
+        }
+
         buildUi()
+        observeUploads()
         if (requiredPermissions().all(::hasPermission)) startCamera()
         else permissions.launch(requiredPermissions().toTypedArray())
+        refreshDriveSilently()
     }
 
     override fun onResume() {
         super.onResume()
-        // Recover from a bind that failed earlier (camera busy, transient HAL error) instead of
-        // forcing the user to kill the app mid-eclipse.
         if (camera == null && requiredPermissions().all(::hasPermission)) startCamera()
     }
 
     override fun onStop() {
-        // Leaving the app unbinds CameraX. Tear the sequence down deterministically so the
-        // shutter is never left disabled when the user comes back.
         cancelSequence("Capture cancelled • app left the foreground")
         super.onStop()
     }
@@ -134,7 +165,10 @@ class MainActivity : ComponentActivity() {
 
     private fun requiredPermissions() = listOf(Manifest.permission.CAMERA)
 
-    private fun hasPermission(p: String) = ContextCompat.checkSelfPermission(this, p) == PackageManager.PERMISSION_GRANTED
+    private fun hasPermission(p: String) =
+        ContextCompat.checkSelfPermission(this, p) == PackageManager.PERMISSION_GRANTED
+
+    // ---- ui ----------------------------------------------------------------
 
     private fun buildUi() {
         val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
@@ -146,24 +180,28 @@ class MainActivity : ComponentActivity() {
         }
         root.addView(preview, FrameLayout.LayoutParams(-1, -1))
 
+        grid = GridOverlay(this).apply { visibility = if (gridOn) View.VISIBLE else View.GONE }
+        root.addView(grid, FrameLayout.LayoutParams(-1, -1))
+
         val top = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(12), dp(16), dp(10))
-            setBackgroundColor(Color.argb(215, 5, 8, 12))
+            setBackgroundColor(Color.argb(200, 5, 8, 12))
         }
         root.addView(top, FrameLayout.LayoutParams(-1, -2, Gravity.TOP))
 
         val titleRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         top.addView(titleRow, LinearLayout.LayoutParams(-1, -2))
-        val titleBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        titleRow.addView(titleBox, LinearLayout.LayoutParams(0, -2, 1f))
-        titleBox.addView(label("EclipseCam", 23f, Color.WHITE, true))
-        titleBox.addView(label("LUNAR ECLIPSE • SHARPNESS MODE", 11f, GOLD, true))
-        rawBadge = label("RAW CHECK…", 11f, MUTED, true).apply {
+        titleRow.addView(
+            label("NorthernCam", 20f, Color.WHITE, true),
+            LinearLayout.LayoutParams(0, -2, 1f)
+        )
+        driveBadge = label("DRIVE: CHECKING…", 10f, MUTED, true).apply {
             setPadding(dp(9), dp(6), dp(9), dp(6))
             setBackgroundColor(PANEL)
         }
-        titleRow.addView(rawBadge)
+        titleRow.addView(driveBadge)
+
         focusBadge = label("FOCUS: TAP", 10f, GOLD, true).apply {
             setPadding(dp(9), dp(5), dp(9), dp(5))
             setBackgroundColor(PANEL)
@@ -175,28 +213,22 @@ class MainActivity : ComponentActivity() {
         val bottom = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(7), dp(12), dp(12))
-            setBackgroundColor(Color.argb(235, 7, 11, 16))
+            setBackgroundColor(Color.argb(230, 7, 11, 16))
         }
         root.addView(bottom, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
 
-        val zoomButtonRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-        bottom.addView(zoomButtonRow, LinearLayout.LayoutParams(-1, -2))
+        // zoom presets + readout
+        val zoomRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        bottom.addView(zoomRow, LinearLayout.LayoutParams(-1, -2))
         zoom1 = smallButton("1×") { setZoom(1f) }
         zoom2 = smallButton("2×") { setZoom(2f) }
-        zoom4 = smallButton("4×") { setZoom(4f) }
-        zoom6 = smallButton("6×") { setZoom(6f) }
         zoomMaxButton = smallButton("MAX") { setZoom(maxZoomRatio) }
-        zoomButtonRow.addView(zoom1)
-        zoomButtonRow.addView(zoom2)
-        zoomButtonRow.addView(zoom4)
-        zoomButtonRow.addView(zoom6)
-        zoomButtonRow.addView(zoomMaxButton)
-        zoomLabel = label("2.0×", 12f, Color.WHITE, true).apply { gravity = Gravity.END }
-        zoomButtonRow.addView(zoomLabel, LinearLayout.LayoutParams(0, -2, 1f))
+        zoomRow.addView(zoom1)
+        zoomRow.addView(zoom2)
+        zoomRow.addView(zoomMaxButton)
+        zoomLabel = label("1×", 12f, Color.WHITE, true).apply { gravity = Gravity.END }
+        zoomRow.addView(zoomLabel, LinearLayout.LayoutParams(0, -2, 1f))
 
-        val zoomSliderRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-        bottom.addView(zoomSliderRow, LinearLayout.LayoutParams(-1, -2))
-        zoomSliderRow.addView(label("ZOOM", 11f, GOLD, true))
         zoomSeek = SeekBar(this).apply {
             max = 1000
             progress = 0
@@ -208,75 +240,57 @@ class MainActivity : ComponentActivity() {
                 override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
             })
         }
-        zoomSliderRow.addView(zoomSeek, LinearLayout.LayoutParams(0, dp(38), 1f))
-        zoomSliderRow.addView(label("PINCH", 10f, MUTED, true))
+        bottom.addView(zoomSeek, LinearLayout.LayoutParams(-1, dp(34)))
 
+        // mode row
         val modeRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         bottom.addView(modeRow, LinearLayout.LayoutParams(-1, -2))
-        bracket = smallButton("BRACKET 3") {
-            if (busy) return@smallButton
-            bracketOn = !bracketOn
-            bracket.text = if (bracketOn) "BRACKET 3" else "SINGLE"
-            styleToggle(bracket, bracketOn)
-            refreshBracketLabel()
-            status.text = if (bracketOn) "3 exposures protect Moon + bright sign" else "Single exposure"
-        }
-        styleToggle(bracket, true)
-        modeRow.addView(bracket)
-        timer = smallButton("2s") {
-            if (busy) return@smallButton
-            timerSeconds = if (timerSeconds == 2) 0 else 2
-            timer.text = "${timerSeconds}s"
-            refreshBracketLabel()
-        }
-        modeRow.addView(timer)
-        farFocus = smallButton("∞ FAR") {
-            if (busy) return@smallButton
-            if (!farFocusSupported) {
-                status.text = "Manual infinity focus not supported on this camera • use tap focus"
-                return@smallButton
-            }
-            setFarFocus(!farFocusOn)
-        }
-        farFocus.isEnabled = false
-        modeRow.addView(farFocus)
-        modeRow.addView(label("MAX QUALITY • TAP LOCKS FOCUS", 10f, GREEN, true).apply {
-            gravity = Gravity.END
-        }, LinearLayout.LayoutParams(0, -2, 1f))
+        flashButton = smallButton(flashText()) { if (!busy) cycleFlash() }
+        modeRow.addView(flashButton)
+        timerButton = smallButton(timerText()) { if (!busy) cycleTimer() }
+        modeRow.addView(timerButton)
+        gridButton = smallButton("GRID") { if (!busy) toggleGrid() }
+        modeRow.addView(gridButton)
+        rawButton = smallButton("RAW") { if (!busy) toggleRaw() }
+        modeRow.addView(rawButton)
+        driveButton = smallButton("DRIVE") { if (!busy) onDriveButton() }
+        modeRow.addView(driveButton)
 
+        // exposure
         val evRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         bottom.addView(evRow, LinearLayout.LayoutParams(-1, -2))
         evRow.addView(label("EV", 13f, GOLD, true))
-        val seek = SeekBar(this).apply {
-            max = 10
-            progress = 5
+        val evSeek = SeekBar(this).apply {
+            max = 12
+            progress = 6
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                    baseEv = -4f + progress * 0.5f
+                    baseEv = (progress - 6) * 0.5f
                     evLabel.text = formatEv(baseEv)
-                    refreshBracketLabel()
                     if (fromUser && !busy) camera?.let { applyEvNow(it, baseEv) }
                 }
                 override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
                 override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
             })
         }
-        evRow.addView(seek, LinearLayout.LayoutParams(0, dp(42), 1f))
+        evRow.addView(evSeek, LinearLayout.LayoutParams(0, dp(40), 1f))
         evLabel = label(formatEv(baseEv), 13f, Color.WHITE, true).apply { gravity = Gravity.END }
-        evRow.addView(evLabel, LinearLayout.LayoutParams(dp(58), -2))
-        bracketLabel = label("", 10f, MUTED, false).apply { gravity = Gravity.CENTER }
-        bottom.addView(bracketLabel)
-        refreshBracketLabel()
+        evRow.addView(evLabel, LinearLayout.LayoutParams(dp(52), -2))
 
+        // shutter row
         val shutterRow = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dp(4), 0, 0)
         }
         bottom.addView(shutterRow, LinearLayout.LayoutParams(-1, -2))
-        val left = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        left.addView(label("SHARPNESS FIRST", 11f, GREEN, true))
-        left.addView(label("Tap a crisp distant edge", 10f, MUTED, false))
-        shutterRow.addView(left, LinearLayout.LayoutParams(0, -2, 1f))
+
+        thumbnail = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            setBackgroundColor(PANEL)
+        }
+        shutterRow.addView(thumbnail, LinearLayout.LayoutParams(dp(52), dp(52)))
+
+        shutterRow.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
         shutter = Button(this).apply {
             text = "●"
             textSize = 42f
@@ -285,10 +299,10 @@ class MainActivity : ComponentActivity() {
             setOnClickListener { beginCapture() }
         }
         shutterRow.addView(shutter, LinearLayout.LayoutParams(dp(92), dp(76)))
-        val right = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.END }
-        right.addView(label("FLASH OFF", 11f, GREEN, true).apply { gravity = Gravity.END })
-        right.addView(label("4× = tele range, not proven optical", 10f, MUTED, false).apply { gravity = Gravity.END })
-        shutterRow.addView(right, LinearLayout.LayoutParams(0, -2, 1f))
+        shutterRow.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+
+        flipButton = smallButton("FLIP") { if (!busy) flipCamera() }
+        shutterRow.addView(flipButton, LinearLayout.LayoutParams(dp(52), dp(44)))
 
         val scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
@@ -316,8 +330,7 @@ class MainActivity : ComponentActivity() {
                 MotionEvent.ACTION_POINTER_DOWN ->
                     gestureMaxPointers = maxOf(gestureMaxPointers, event.pointerCount)
                 MotionEvent.ACTION_UP -> {
-                    // Only a genuine single-finger tap re-meters. A pinch, a drag or a
-                    // lingering finger must never silently throw away a focus lock.
+                    // Only a real single-finger tap re-meters; a pinch or a drag must not.
                     val moved = hypot(event.x - downX, event.y - downY)
                     if (!busy && !gestureHadScale && gestureMaxPointers == 1 &&
                         moved <= slop && event.eventTime - downTime <= TAP_MAX_MS
@@ -328,8 +341,75 @@ class MainActivity : ComponentActivity() {
             }
             true
         }
+
+        styleToggle(gridButton, gridOn)
+        styleToggle(rawButton, rawWanted)
+        styleToggle(flashButton, flashMode != ImageCapture.FLASH_MODE_OFF)
+        styleToggle(timerButton, timerSeconds > 0)
         refreshZoomButtons()
     }
+
+    // ---- modes -------------------------------------------------------------
+
+    private fun flashText() = when (flashMode) {
+        ImageCapture.FLASH_MODE_ON -> "FLASH ON"
+        ImageCapture.FLASH_MODE_AUTO -> "FLASH AUTO"
+        else -> "FLASH OFF"
+    }
+
+    private fun timerText() = if (timerSeconds == 0) "TIMER OFF" else "${timerSeconds}s"
+
+    private fun cycleFlash() {
+        flashMode = when (flashMode) {
+            ImageCapture.FLASH_MODE_OFF -> ImageCapture.FLASH_MODE_AUTO
+            ImageCapture.FLASH_MODE_AUTO -> ImageCapture.FLASH_MODE_ON
+            else -> ImageCapture.FLASH_MODE_OFF
+        }
+        prefs.edit().putInt(PREF_FLASH, flashMode).apply()
+        capture?.flashMode = flashMode
+        flashButton.text = flashText()
+        styleToggle(flashButton, flashMode != ImageCapture.FLASH_MODE_OFF)
+        if (camera?.cameraInfo?.hasFlashUnit() == false && flashMode != ImageCapture.FLASH_MODE_OFF) {
+            status.text = "This camera has no flash"
+        }
+    }
+
+    private fun cycleTimer() {
+        timerSeconds = when (timerSeconds) {
+            0 -> 3
+            3 -> 10
+            else -> 0
+        }
+        prefs.edit().putInt(PREF_TIMER, timerSeconds).apply()
+        timerButton.text = timerText()
+        styleToggle(timerButton, timerSeconds > 0)
+    }
+
+    private fun toggleGrid() {
+        gridOn = !gridOn
+        prefs.edit().putBoolean(PREF_GRID, gridOn).apply()
+        grid.visibility = if (gridOn) View.VISIBLE else View.GONE
+        styleToggle(gridButton, gridOn)
+    }
+
+    private fun toggleRaw() {
+        if (!rawAvailable) {
+            status.text = "This camera does not offer RAW"
+            return
+        }
+        rawWanted = !rawWanted
+        prefs.edit().putBoolean(PREF_RAW, rawWanted).apply()
+        styleToggle(rawButton, rawWanted)
+        provider?.let { bindCamera(it) }
+    }
+
+    private fun flipCamera() {
+        lensBack = !lensBack
+        focusLocked = false
+        provider?.let { bindCamera(it) }
+    }
+
+    // ---- camera ------------------------------------------------------------
 
     private fun startCamera() {
         if (starting) return
@@ -343,58 +423,65 @@ class MainActivity : ComponentActivity() {
             } catch (t: Throwable) {
                 camera = null
                 capture = null
-                status.text = "Camera failed: ${t.message ?: "unknown"} • reopen the app to retry"
+                status.text = "Camera failed: ${t.message ?: "unknown"}"
             }
         }, ContextCompat.getMainExecutor(this))
     }
 
     private fun bindCamera(p: ProcessCameraProvider) {
-        val selector = CameraSelector.DEFAULT_BACK_CAMERA
-        val previewUseCase = Preview.Builder().build().also { it.setSurfaceProvider(preview.surfaceProvider) }
-        p.unbindAll()
+        val selector =
+            if (lensBack) CameraSelector.DEFAULT_BACK_CAMERA else CameraSelector.DEFAULT_FRONT_CAMERA
+        val previewUseCase = Preview.Builder().build()
+            .also { it.setSurfaceProvider(preview.surfaceProvider) }
 
-        var ic = buildCapture(false)
-        var bound = p.bindToLifecycle(this, selector, previewUseCase, ic)
+        try {
+            p.unbindAll()
+            var ic = buildCapture(false)
+            var bound = p.bindToLifecycle(this, selector, previewUseCase, ic)
 
-        rawJpeg = runCatching {
-            ImageCapture.getImageCaptureCapabilities(bound.cameraInfo)
-                .supportedOutputFormats.contains(ImageCapture.OUTPUT_FORMAT_RAW_JPEG)
-        }.getOrDefault(false)
-        if (rawJpeg) {
-            try {
-                p.unbindAll()
-                ic = buildCapture(true)
-                bound = p.bindToLifecycle(this, selector, previewUseCase, ic)
-            } catch (_: Throwable) {
-                rawJpeg = false
-                p.unbindAll()
-                ic = buildCapture(false)
-                bound = p.bindToLifecycle(this, selector, previewUseCase, ic)
+            rawAvailable = runCatching {
+                ImageCapture.getImageCaptureCapabilities(bound.cameraInfo)
+                    .supportedOutputFormats.contains(ImageCapture.OUTPUT_FORMAT_RAW_JPEG)
+            }.getOrDefault(false)
+
+            rawActive = false
+            if (rawAvailable && rawWanted) {
+                try {
+                    p.unbindAll()
+                    ic = buildCapture(true)
+                    bound = p.bindToLifecycle(this, selector, previewUseCase, ic)
+                    rawActive = true
+                } catch (_: Throwable) {
+                    p.unbindAll()
+                    ic = buildCapture(false)
+                    bound = p.bindToLifecycle(this, selector, previewUseCase, ic)
+                }
             }
-        }
 
-        camera = bound
-        capture = ic
-        rawProven = false
-        farFocusOn = false
-        focusLocked = false
-        focusBadge.text = "FOCUS: TAP"
-        focusBadge.setTextColor(GOLD)
-        refreshRawBadge()
-        farFocusSupported = detectFarFocusSupport(bound.cameraInfo)
-        farFocus.isEnabled = farFocusSupported
-        styleToggle(farFocus, false)
-        maxZoomRatio = (bound.cameraInfo.zoomState.value?.maxZoomRatio ?: 1f).coerceAtLeast(1f)
-        zoomMaxButton.text = if (maxZoomRatio >= 9.5f) "MAX" else "${formatZoom(maxZoomRatio)}×"
-        setZoom(if (maxZoomRatio >= 3.9f) 4f else if (maxZoomRatio >= 1.9f) 2f else 1f)
-        focusLocked = false
-        applyEvNow(bound, baseEv)
-        refreshBracketLabel()
-        setControls(true)
-        status.text = if (rawJpeg) {
-            "Ready • MAX QUALITY • RAW+JPEG armed • tap a crisp distant edge to lock focus"
-        } else {
-            "Ready • MAX QUALITY • JPEG • tap a crisp distant edge to lock focus"
+            camera = bound
+            capture = ic
+            focusLocked = false
+            focusBadge.text = "FOCUS: TAP"
+            focusBadge.setTextColor(GOLD)
+            rawButton.isEnabled = rawAvailable
+            styleToggle(rawButton, rawActive)
+            styleToggle(flashButton, flashMode != ImageCapture.FLASH_MODE_OFF)
+            styleToggle(timerButton, timerSeconds > 0)
+            maxZoomRatio = (bound.cameraInfo.zoomState.value?.maxZoomRatio ?: 1f).coerceAtLeast(1f)
+            zoomMaxButton.text = if (maxZoomRatio >= 9.5f) "MAX" else "${formatZoom(maxZoomRatio)}×"
+            setZoom(1f)
+            applyEvNow(bound, baseEv)
+            setControls(true)
+            status.text = buildString {
+                append(if (lensBack) "Rear camera" else "Front camera")
+                append(if (rawActive) " • RAW+JPEG" else " • JPEG")
+                append(if (autoUpload && driveConnected) " • uploading to Drive" else " • saving to phone")
+            }
+        } catch (t: Throwable) {
+            camera = null
+            capture = null
+            setControls(false)
+            status.text = "Could not open that camera: ${t.message ?: "unknown"}"
         }
     }
 
@@ -402,35 +489,13 @@ class MainActivity : ComponentActivity() {
         .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
         .also { if (raw) it.setOutputFormat(ImageCapture.OUTPUT_FORMAT_RAW_JPEG) }
         .build()
-        .also { it.flashMode = ImageCapture.FLASH_MODE_OFF }
-
-    private fun refreshRawBadge() {
-        when {
-            !rawJpeg -> {
-                rawBadge.text = "JPEG"
-                rawBadge.setTextColor(MUTED)
-            }
-            rawProven -> {
-                rawBadge.text = "RAW + JPEG ✓"
-                rawBadge.setTextColor(GREEN)
-            }
-            else -> {
-                // Capability + a successful bind are not proof that a DNG reaches storage.
-                rawBadge.text = "RAW + JPEG ARMED"
-                rawBadge.setTextColor(GOLD)
-            }
-        }
-    }
-
-    // ---- focus -------------------------------------------------------------
+        .also { it.flashMode = flashMode }
 
     private fun tapMeter(x: Float, y: Float) {
         val c = camera ?: return
-        if (farFocusOn) setFarFocus(false)
         val point = preview.meteringPointFactory.createPoint(x, y)
         val flags = FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE or FocusMeteringAction.FLAG_AWB
-        // No auto-cancel: on a black sky, letting AF fall back to continuous mode after a
-        // timeout will hunt off the Moon and the badge would keep claiming a lock it lost.
+        // No auto-cancel: a lock the user set stays until they set another one.
         val action = FocusMeteringAction.Builder(point, flags).disableAutoCancel().build()
         focusBadge.text = "FOCUSING…"
         focusBadge.setTextColor(GOLD)
@@ -438,20 +503,17 @@ class MainActivity : ComponentActivity() {
         val result = runCatching { c.cameraControl.startFocusAndMetering(action) }.getOrNull()
         if (result == null) {
             focusBadge.text = "FOCUS: RETAP"
-            focusBadge.setTextColor(GOLD)
             return
         }
         result.addListener({
-            runCatching { result.get() }.onSuccess { focusResult ->
-                if (focusResult.isFocusSuccessful) {
+            runCatching { result.get() }.onSuccess {
+                if (it.isFocusSuccessful) {
                     focusLocked = true
                     focusBadge.text = "FOCUS ✓ LOCKED"
                     focusBadge.setTextColor(GREEN)
-                    status.text = "Focus + metering held until you tap again"
                 } else {
                     focusBadge.text = "FOCUS: RETAP"
                     focusBadge.setTextColor(GOLD)
-                    status.text = "Focus uncertain • tap a crisp distant edge, or use ∞ FAR"
                 }
             }.onFailure {
                 focusBadge.text = "FOCUS: RETAP"
@@ -460,65 +522,11 @@ class MainActivity : ComponentActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    @androidx.annotation.OptIn(markerClass = [ExperimentalCamera2Interop::class])
-    private fun detectFarFocusSupport(info: CameraInfo): Boolean = runCatching {
-        val c2 = Camera2CameraInfo.from(info)
-        val modes = c2.getCameraCharacteristic(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
-        val minFocus = c2.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)
-        modes != null && modes.contains(CameraMetadata.CONTROL_AF_MODE_OFF) && (minFocus ?: 0f) > 0f
-    }.getOrDefault(false)
-
-    /**
-     * Drives the lens to the far end (focus distance 0 dioptres = infinity) with AF switched off.
-     * For a Moon at optical infinity this is more dependable than asking AF to find contrast in a
-     * near-black frame. Any tap-to-focus hands control back to AF.
-     */
-    @androidx.annotation.OptIn(markerClass = [ExperimentalCamera2Interop::class])
-    private fun setFarFocus(on: Boolean) {
-        val c = camera ?: return
-        farFocusOn = on
-        styleToggle(farFocus, on)
-        focusLocked = on
-        focusBadge.text = if (on) "FOCUS ∞ MANUAL" else "FOCUS: TAP"
-        focusBadge.setTextColor(if (on) GREEN else GOLD)
-        val future = runCatching {
-            val control = Camera2CameraControl.from(c.cameraControl)
-            if (on) {
-                control.setCaptureRequestOptions(
-                    CaptureRequestOptions.Builder()
-                        .setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
-                        .setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, 0f)
-                        .build()
-                )
-            } else {
-                control.clearCaptureRequestOptions()
-            }
-        }.getOrNull()
-        if (future == null) {
-            revertFarFocus()
-            return
-        }
-        future.addListener({
-            if (runCatching { future.get() }.isFailure && on) revertFarFocus()
-            else if (on) status.text = "Manual infinity focus engaged • verify Moon sharpness in preview"
-        }, ContextCompat.getMainExecutor(this))
-    }
-
-    private fun revertFarFocus() {
-        farFocusOn = false
-        focusLocked = false
-        styleToggle(farFocus, false)
-        focusBadge.text = "FOCUS: TAP"
-        focusBadge.setTextColor(GOLD)
-        status.text = "Infinity focus not accepted by the camera • use tap focus"
-    }
-
-    private fun invalidateFocus(reason: String) {
-        if (!focusLocked || farFocusOn) return
+    private fun invalidateFocus() {
+        if (!focusLocked) return
         focusLocked = false
         focusBadge.text = "FOCUS: RETAP"
         focusBadge.setTextColor(GOLD)
-        status.text = reason
     }
 
     // ---- zoom --------------------------------------------------------------
@@ -536,22 +544,12 @@ class MainActivity : ComponentActivity() {
         runCatching { c.cameraControl.setZoomRatio(zoomRatio) }
         refreshZoomButtons()
         zoomLabel.text = "${formatZoom(zoomRatio)}× / ${formatZoom(maxZoomRatio)}×"
-        val targetProgress = zoomToProgress(zoomRatio)
-        if (zoomSeek.progress != targetProgress) zoomSeek.progress = targetProgress
-        // Changing the crop moves the metering region under the lock, so the previous
-        // focus/AE point is no longer the thing the user aimed at.
-        if (changed) invalidateFocus("Zoom changed • retap to lock focus at this framing")
-        if (focusLocked || farFocusOn) return
-        status.text = when {
-            zoomRatio >= TELE_RATIO + 0.4f -> "${formatZoom(zoomRatio)}× digital crop • no extra optical detail"
-            zoomRatio >= TELE_RATIO - 0.3f -> "${formatZoom(zoomRatio)}× telephoto range • lens choice is the camera's"
-            zoomRatio >= 1.5f -> "${formatZoom(zoomRatio)}× crop of the main sensor"
-            else -> "1× wide scene"
-        }
+        val target = zoomToProgress(zoomRatio)
+        if (zoomSeek.progress != target) zoomSeek.progress = target
+        if (changed) invalidateFocus()
     }
 
-    // Logarithmic so the 1×–4× framing range that actually matters gets half the slider
-    // travel instead of the ~15% a linear map gives it on a 20× camera.
+    // Logarithmic: the low end, where most framing happens, gets proportionate travel.
     private fun progressToZoom(progress: Int): Float {
         if (maxZoomRatio <= 1f) return 1f
         val t = progress.coerceIn(0, 1000) / 1000f
@@ -568,32 +566,20 @@ class MainActivity : ComponentActivity() {
         if (!::zoom1.isInitialized) return
         styleToggle(zoom1, abs(zoomRatio - 1f) < .25f)
         styleToggle(zoom2, abs(zoomRatio - 2f) < .35f)
-        styleToggle(zoom4, abs(zoomRatio - 4f) < .55f)
-        styleToggle(zoom6, abs(zoomRatio - 6f) < .75f)
         styleToggle(zoomMaxButton, maxZoomRatio > 1.1f && abs(zoomRatio - maxZoomRatio) < .45f)
     }
 
     // ---- exposure ----------------------------------------------------------
 
-    private fun evStep(c: Camera): Float {
-        val s = c.cameraInfo.exposureState
-        if (!s.isExposureCompensationSupported) return 0f
-        val step = s.exposureCompensationStep.toFloat()
-        return if (step > 0f) step else 0f
-    }
-
     private fun evIndex(c: Camera, ev: Float): Int? {
-        val step = evStep(c)
+        val s = c.cameraInfo.exposureState
+        if (!s.isExposureCompensationSupported) return null
+        val step = s.exposureCompensationStep.toFloat()
         if (step <= 0f) return null
-        val range = c.cameraInfo.exposureState.exposureCompensationRange
-        return (ev / step).roundToInt().coerceIn(range.lower, range.upper)
-    }
-
-    /** What the device will really deliver for [ev] after range and step-size clamping. */
-    private fun achievedEv(c: Camera, ev: Float): Float {
-        val step = evStep(c)
-        val index = evIndex(c, ev) ?: return 0f
-        return index * step
+        return (ev / step).roundToInt().coerceIn(
+            s.exposureCompensationRange.lower,
+            s.exposureCompensationRange.upper
+        )
     }
 
     private fun applyEvNow(c: Camera, ev: Float) {
@@ -601,19 +587,12 @@ class MainActivity : ComponentActivity() {
         runCatching { c.cameraControl.setExposureCompensationIndex(index) }
     }
 
-    /**
-     * Applies [ev] and waits for CameraX to report the new compensation as actually in effect
-     * before running [then]. A blind fixed delay was the previous behaviour and could fire a
-     * bracket frame while the sensor was still on the old exposure.
-     */
     private fun applyEv(c: Camera, ev: Float, token: Int, then: () -> Unit) {
         val proceed = Runnable { if (token == captureToken) then() }
         val index = evIndex(c, ev)
-        if (index == null) {
-            handler.postDelayed(proceed, EV_SETTLE_MS)
-            return
+        val future = index?.let {
+            runCatching { c.cameraControl.setExposureCompensationIndex(it) }.getOrNull()
         }
-        val future = runCatching { c.cameraControl.setExposureCompensationIndex(index) }.getOrNull()
         if (future == null) {
             handler.postDelayed(proceed, EV_SETTLE_MS)
             return
@@ -625,36 +604,7 @@ class MainActivity : ComponentActivity() {
             handler.postDelayed(proceed, EV_SETTLE_MS)
         }
         future.addListener({ once.run() }, ContextCompat.getMainExecutor(this))
-        // The future normally completes once AE has converged; cap the wait so a HAL that
-        // never reports back cannot stall the sequence.
         handler.postDelayed(once, EV_CONVERGE_TIMEOUT_MS)
-    }
-
-    private fun bracketEvs(c: Camera?): List<Float> {
-        val wanted = listOf(baseEv - 1.5f, baseEv, baseEv + 1.5f)
-        if (c == null) return wanted
-        val step = evStep(c)
-        if (step <= 0f) return listOf(baseEv)
-        val range = c.cameraInfo.exposureState.exposureCompensationRange
-        return wanted.map { it.coerceIn(range.lower * step, range.upper * step) }
-    }
-
-    private fun refreshBracketLabel() {
-        if (!::bracketLabel.isInitialized) return
-        val c = camera
-        if (!bracketOn) {
-            bracketLabel.text = "Single exposure at ${formatEv(c?.let { achievedEv(it, baseEv) } ?: baseEv)} EV" +
-                " • ${timerSeconds}s anti-shake timer"
-            return
-        }
-        val evs = bracketEvs(c).map { c?.let { cam -> achievedEv(cam, it) } ?: it }
-        val distinct = evs.distinct()
-        val text = "Bracket: " + distinct.joinToString(" • ") { formatEv(it) } + " EV • ${timerSeconds}s anti-shake timer"
-        bracketLabel.text = if (distinct.size < evs.size) {
-            "$text  (device EV range limits this to ${distinct.size} distinct exposures)"
-        } else {
-            text
-        }
     }
 
     // ---- capture -----------------------------------------------------------
@@ -668,7 +618,6 @@ class MainActivity : ComponentActivity() {
         busy = true
         setControls(false)
         val token = captureToken
-        status.text = if (timerSeconds > 0) "Hold still • ${timerSeconds}s anti-shake timer…" else "Hold still • capturing…"
         val go = Runnable {
             if (token != captureToken) return@Runnable
             val ic = capture
@@ -677,55 +626,31 @@ class MainActivity : ComponentActivity() {
                 failCapture("Camera went away before capture")
                 return@Runnable
             }
-            if (bracketOn) {
-                captureBracket(ic, c, bracketEvs(c), 0, mutableListOf(), token)
-            } else {
-                applyEv(c, baseEv, token) {
-                    captureOne(ic, achievedEv(c, baseEv), token, { uris -> finishCapture(uris, 1) }, ::failCapture)
-                }
-            }
+            status.text = "Capturing…"
+            applyEv(c, baseEv, token) { captureOne(ic, token) }
         }
-        if (timerSeconds > 0) handler.postDelayed(go, timerSeconds * 1000L) else go.run()
+        if (timerSeconds > 0) {
+            countdown(timerSeconds, token, go)
+        } else {
+            go.run()
+        }
     }
 
-    private fun captureBracket(
-        ic: ImageCapture,
-        c: Camera,
-        evs: List<Float>,
-        index: Int,
-        saved: MutableList<Uri>,
-        token: Int
-    ) {
+    private fun countdown(remaining: Int, token: Int, then: Runnable) {
         if (token != captureToken) return
-        if (index >= evs.size) {
-            applyEvNow(c, baseEv)
-            finishCapture(saved, evs.size)
+        if (remaining <= 0) {
+            then.run()
             return
         }
-        val ev = evs[index]
-        val achieved = achievedEv(c, ev)
-        status.text = "Exposure ${index + 1}/${evs.size} • ${formatEv(achieved)} EV"
-        applyEv(c, ev, token) {
-            captureOne(ic, achieved, token, { uris ->
-                saved.addAll(uris)
-                handler.postDelayed({ captureBracket(ic, c, evs, index + 1, saved, token) }, INTER_FRAME_MS)
-            }, ::failCapture)
-        }
+        status.text = "Hold still • $remaining…"
+        handler.postDelayed({ countdown(remaining - 1, token, then) }, 1000)
     }
 
-    private fun captureOne(
-        ic: ImageCapture,
-        ev: Float,
-        token: Int,
-        onSaved: (List<Uri>) -> Unit,
-        onError: (String) -> Unit
-    ) {
+    private fun captureOne(ic: ImageCapture, token: Int) {
         if (token != captureToken) return
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
-        val tag = evTag(ev)
         var settled = false
-        // Every exit from a frame goes through here exactly once, so no callback ordering,
-        // duplicate delivery or missing second file can leave `busy` stuck true.
+        // Single exit point: no callback ordering or missing second file can strand the shutter.
         fun resolve(block: () -> Unit) {
             if (settled || token != captureToken) return
             settled = true
@@ -734,54 +659,68 @@ class MainActivity : ComponentActivity() {
         }
         armWatchdog(token)
         try {
-            if (rawJpeg) {
-                val rawOpt = outputOptions("EclipseCam_${stamp}_$tag.dng", "image/x-adobe-dng")
-                val jpgOpt = outputOptions("EclipseCam_${stamp}_$tag.jpg", "image/jpeg")
-                val uris = mutableListOf<Uri>()
-                ic.takePicture(rawOpt, jpgOpt, ContextCompat.getMainExecutor(this), object : ImageCapture.OnImageSavedCallback {
-                    override fun onImageSaved(result: ImageCapture.OutputFileResults) {
-                        if (settled || token != captureToken) return
-                        result.savedUri?.let(uris::add)
-                        // RAW+JPEG reports one callback per file, in no guaranteed order.
-                        if (uris.size >= 2) {
-                            if (!rawProven) {
-                                rawProven = true
-                                refreshRawBadge()
-                            }
-                            resolve { onSaved(uris.toList()) }
+            if (rawActive) {
+                val dngName = "${NAME_PREFIX}_$stamp.dng"
+                val jpgName = "${NAME_PREFIX}_$stamp.jpg"
+                val shots = mutableListOf<Shot>()
+                ic.takePicture(
+                    outputOptions(dngName, MIME_DNG),
+                    outputOptions(jpgName, MIME_JPEG),
+                    ContextCompat.getMainExecutor(this),
+                    object : ImageCapture.OnImageSavedCallback {
+                        override fun onImageSaved(result: ImageCapture.OutputFileResults) {
+                            if (settled || token != captureToken) return
+                            val uri = result.savedUri ?: return
+                            // RAW+JPEG delivers one callback per file, in no guaranteed order,
+                            // so the saved name is what tells us which one this is.
+                            shots.add(shotFor(uri, jpgName))
+                            if (shots.size >= 2) resolve { finishCapture(shots.toList()) }
                         }
-                    }
 
-                    override fun onError(exception: ImageCaptureException) {
-                        val partial = uris.toList()
-                        resolve {
-                            if (partial.isEmpty()) {
-                                onError("RAW+JPEG capture failed: ${exception.message ?: "camera error"}")
-                            } else {
-                                // One of the two files landed. Keep it, tell the truth, and
-                                // let the sequence continue rather than aborting the bracket.
-                                rawBadge.text = "RAW PARTIAL"
-                                rawBadge.setTextColor(GOLD)
-                                onSaved(partial)
+                        override fun onError(exception: ImageCaptureException) {
+                            val partial = shots.toList()
+                            resolve {
+                                if (partial.isEmpty()) {
+                                    failCapture("Capture failed: ${exception.message ?: "camera error"}")
+                                } else {
+                                    finishCapture(partial)
+                                }
                             }
                         }
                     }
-                })
+                )
             } else {
-                val jpgOpt = outputOptions("EclipseCam_${stamp}_$tag.jpg", "image/jpeg")
-                ic.takePicture(jpgOpt, ContextCompat.getMainExecutor(this), object : ImageCapture.OnImageSavedCallback {
-                    override fun onImageSaved(result: ImageCapture.OutputFileResults) {
-                        resolve { onSaved(listOfNotNull(result.savedUri)) }
-                    }
+                val jpgName = "${NAME_PREFIX}_$stamp.jpg"
+                ic.takePicture(
+                    outputOptions(jpgName, MIME_JPEG),
+                    ContextCompat.getMainExecutor(this),
+                    object : ImageCapture.OnImageSavedCallback {
+                        override fun onImageSaved(result: ImageCapture.OutputFileResults) {
+                            val uri = result.savedUri
+                            resolve {
+                                if (uri == null) failCapture("Saved, but the file could not be located")
+                                else finishCapture(listOf(Shot(uri, jpgName, MIME_JPEG)))
+                            }
+                        }
 
-                    override fun onError(exception: ImageCaptureException) {
-                        resolve { onError("Capture failed: ${exception.message ?: "camera error"}") }
+                        override fun onError(exception: ImageCaptureException) {
+                            resolve { failCapture("Capture failed: ${exception.message ?: "camera error"}") }
+                        }
                     }
-                })
+                )
             }
         } catch (t: Throwable) {
-            resolve { onError("Capture rejected: ${t.message ?: t.javaClass.simpleName}") }
+            resolve { failCapture("Capture rejected: ${t.message ?: t.javaClass.simpleName}") }
         }
+    }
+
+    /** MediaStore may adjust the name it stores, so read back what it actually used. */
+    private fun shotFor(uri: Uri, fallbackName: String): Shot {
+        val name = runCatching {
+            contentResolver.query(uri, arrayOf(MediaStore.Images.Media.DISPLAY_NAME), null, null, null)
+                ?.use { if (it.moveToFirst()) it.getString(0) else null }
+        }.getOrNull() ?: fallbackName
+        return Shot(uri, name, if (name.endsWith(".dng", true)) MIME_DNG else MIME_JPEG)
     }
 
     private fun armWatchdog(token: Int) {
@@ -791,8 +730,7 @@ class MainActivity : ComponentActivity() {
             captureToken++
             busy = false
             setControls(true)
-            camera?.let { applyEvNow(it, baseEv) }
-            status.text = "Capture timed out • controls released • try again"
+            status.text = "Capture timed out • controls released"
             Toast.makeText(this, "Capture timed out", Toast.LENGTH_LONG).show()
         }
         watchdog = r
@@ -808,7 +746,6 @@ class MainActivity : ComponentActivity() {
         captureToken++
         cancelWatchdog()
         handler.removeCallbacksAndMessages(null)
-        camera?.let { applyEvNow(it, baseEv) }
         if (busy) {
             busy = false
             setControls(true)
@@ -820,45 +757,159 @@ class MainActivity : ComponentActivity() {
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, name)
             put(MediaStore.Images.Media.MIME_TYPE, mime)
-            put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/EclipseCam")
+            put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/$NAME_PREFIX")
         }
-        return ImageCapture.OutputFileOptions.Builder(contentResolver, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values).build()
+        return ImageCapture.OutputFileOptions
+            .Builder(contentResolver, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            .build()
     }
 
-    private fun finishCapture(uris: List<Uri>, frames: Int) {
+    private fun finishCapture(shots: List<Shot>) {
         cancelWatchdog()
         busy = false
         setControls(true)
-        val expected = if (rawJpeg) frames * 2 else frames
-        val mode = if (rawJpeg) "RAW+JPEG" else "JPEG"
-        status.text = if (uris.size < expected) {
-            "Saved ${uris.size}/$expected files • $mode • ${formatZoom(zoomRatio)}× • check Pictures/EclipseCam"
+        shots.firstOrNull { it.mime == MIME_JPEG }?.let { showThumbnail(it.uri) }
+
+        val queued = if (autoUpload && driveConnected) {
+            shots.forEach { UploadWorker.enqueue(this, it.uri, it.name, it.mime) }
+            shots.size
         } else {
-            "Saved $frames exposure${if (frames == 1) "" else "s"} • $mode • ${formatZoom(zoomRatio)}×"
+            0
         }
-        Toast.makeText(this, "Saved ${uris.size} file${if (uris.size == 1) "" else "s"}", Toast.LENGTH_LONG).show()
+        status.text = buildString {
+            append("Saved ${shots.size} file${if (shots.size == 1) "" else "s"}")
+            when {
+                queued > 0 -> append(" • uploading to Drive")
+                !driveConnected -> append(" • Drive not connected")
+                else -> append(" • auto-upload off")
+            }
+        }
     }
 
     private fun failCapture(message: String) {
         cancelWatchdog()
         busy = false
         setControls(true)
-        camera?.let { applyEvNow(it, baseEv) }
         status.text = message
         Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     }
 
+    private fun showThumbnail(uri: Uri) {
+        val size = Size(dp(96), dp(96))
+        Thread {
+            val bitmap = runCatching { contentResolver.loadThumbnail(uri, size, null) }.getOrNull()
+            if (bitmap != null) runOnUiThread { thumbnail.setImageBitmap(bitmap) }
+        }.start()
+    }
+
+    // ---- drive -------------------------------------------------------------
+
+    private fun setDriveConnected(connected: Boolean) {
+        driveConnected = connected
+        refreshDriveBadge()
+    }
+
+    private fun refreshDriveBadge(extra: String? = null) {
+        driveBadge.text = extra ?: when {
+            !driveConnected -> "DRIVE: TAP TO CONNECT"
+            autoUpload -> "DRIVE: AUTO ✓"
+            else -> "DRIVE: MANUAL"
+        }
+        driveBadge.setTextColor(
+            when {
+                extra != null -> GOLD
+                driveConnected && autoUpload -> GREEN
+                driveConnected -> MUTED
+                else -> GOLD
+            }
+        )
+        styleToggle(driveButton, driveConnected && autoUpload)
+    }
+
+    /** Checks for an existing grant without showing anything, so a returning user is just connected. */
+    private fun refreshDriveSilently() {
+        Identity.getAuthorizationClient(this)
+            .authorize(Drive.authorizationRequest())
+            .addOnSuccessListener { result -> setDriveConnected(!result.hasResolution()) }
+            .addOnFailureListener {
+                setDriveConnected(false)
+                driveBadge.text = "DRIVE: UNAVAILABLE"
+            }
+    }
+
+    private fun onDriveButton() {
+        if (!driveConnected) {
+            connectDrive()
+            return
+        }
+        autoUpload = !autoUpload
+        prefs.edit().putBoolean(PREF_AUTO_UPLOAD, autoUpload).apply()
+        refreshDriveBadge()
+        status.text = if (autoUpload) {
+            "Auto-upload on • every shot goes to Drive/${Drive.FOLDER_NAME}"
+        } else {
+            "Auto-upload off • photos stay on the phone"
+        }
+    }
+
+    private fun connectDrive() {
+        status.text = "Connecting to Google Drive…"
+        Identity.getAuthorizationClient(this)
+            .authorize(Drive.authorizationRequest())
+            .addOnSuccessListener { result ->
+                val pendingIntent = result.pendingIntent
+                if (result.hasResolution() && pendingIntent != null) {
+                    runCatching {
+                        authLauncher.launch(
+                            IntentSenderRequest.Builder(pendingIntent.intentSender).build()
+                        )
+                    }.onFailure {
+                        status.text = "Could not open the Google consent screen: ${it.message}"
+                    }
+                } else {
+                    setDriveConnected(true)
+                    status.text = "Google Drive connected • uploads go to Drive/${Drive.FOLDER_NAME}"
+                }
+            }
+            .addOnFailureListener {
+                setDriveConnected(false)
+                status.text = "Google sign-in unavailable: ${it.message ?: "unknown"}"
+            }
+    }
+
+    private fun observeUploads() {
+        WorkManager.getInstance(this)
+            .getWorkInfosByTagLiveData(UploadWorker.TAG)
+            .observe(this) { infos ->
+                if (infos == null) return@observe
+                val active = infos.count { !it.state.isFinished }
+                val failed = infos.filter { it.state == WorkInfo.State.FAILED }
+                when {
+                    active > 0 -> refreshDriveBadge("DRIVE: ↑ $active")
+                    failed.isNotEmpty() -> {
+                        refreshDriveBadge("DRIVE: ${failed.size} FAILED")
+                        failed.last().outputData.getString(UploadWorker.KEY_ERROR)
+                            ?.let { status.text = it }
+                    }
+                    else -> refreshDriveBadge()
+                }
+            }
+    }
+
+    // ---- helpers -----------------------------------------------------------
+
     private fun setControls(enabled: Boolean) {
         val ready = camera != null
         shutter.isEnabled = enabled && ready
-        bracket.isEnabled = enabled
-        timer.isEnabled = enabled
-        farFocus.isEnabled = enabled && ready && farFocusSupported
+        flipButton.isEnabled = enabled
+        flashButton.isEnabled = enabled
+        timerButton.isEnabled = enabled
+        gridButton.isEnabled = enabled
+        rawButton.isEnabled = enabled && rawAvailable
+        driveButton.isEnabled = enabled
         zoomSeek.isEnabled = enabled && ready
         zoom1.isEnabled = enabled && ready
         zoom2.isEnabled = enabled && ready && maxZoomRatio >= 1.9f
-        zoom4.isEnabled = enabled && ready && maxZoomRatio >= 3.9f
-        zoom6.isEnabled = enabled && ready && maxZoomRatio >= 5.9f
         zoomMaxButton.isEnabled = enabled && ready && maxZoomRatio > 1.1f
     }
 
@@ -887,10 +938,33 @@ class MainActivity : ComponentActivity() {
         if (bold) setTypeface(typeface, Typeface.BOLD)
     }
 
-    private fun formatEv(ev: Float) = if (ev > 0) "+%.1f".format(Locale.US, ev) else "%.1f".format(Locale.US, ev)
-    private fun formatZoom(z: Float) = if (abs(z - z.roundToInt()) < .05f) z.roundToInt().toString() else "%.1f".format(Locale.US, z)
-    private fun evTag(ev: Float) = "EV_${if (ev < 0) "m" else if (ev > 0) "p" else "z"}${"%.1f".format(Locale.US, abs(ev)).replace('.', '_')}"
+    private fun formatEv(ev: Float) =
+        if (ev > 0) "+%.1f".format(Locale.US, ev) else "%.1f".format(Locale.US, ev)
+
+    private fun formatZoom(z: Float) =
+        if (abs(z - z.roundToInt()) < .05f) z.roundToInt().toString() else "%.1f".format(Locale.US, z)
+
     private fun dp(v: Int) = (v * resources.displayMetrics.density).roundToInt()
+
+    /** Rule-of-thirds guides. */
+    private class GridOverlay(context: Context) : View(context) {
+        private val paint = Paint().apply {
+            color = Color.argb(90, 255, 255, 255)
+            strokeWidth = 1f
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val w = width.toFloat()
+            val h = height.toFloat()
+            for (i in 1..2) {
+                val x = w * i / 3f
+                val y = h * i / 3f
+                canvas.drawLine(x, 0f, x, h, paint)
+                canvas.drawLine(0f, y, w, y, paint)
+            }
+        }
+    }
 
     companion object {
         private const val GOLD = 0xFFFFD878.toInt()
@@ -898,12 +972,19 @@ class MainActivity : ComponentActivity() {
         private const val MUTED = 0xFFBAC3CD.toInt()
         private const val PANEL = 0xFF192028.toInt()
 
-        /** Pixel 6 Pro telephoto native ratio; used only for honest labelling, not lens selection. */
-        private const val TELE_RATIO = 4f
+        private const val NAME_PREFIX = "NorthernCam"
+        private const val MIME_JPEG = "image/jpeg"
+        private const val MIME_DNG = "image/x-adobe-dng"
+
+        private const val PREF_AUTO_UPLOAD = "autoUpload"
+        private const val PREF_RAW = "raw"
+        private const val PREF_GRID = "grid"
+        private const val PREF_TIMER = "timer"
+        private const val PREF_FLASH = "flash"
+
         private const val TAP_MAX_MS = 500L
-        private const val EV_SETTLE_MS = 250L
-        private const val EV_CONVERGE_TIMEOUT_MS = 2500L
-        private const val INTER_FRAME_MS = 250L
+        private const val EV_SETTLE_MS = 200L
+        private const val EV_CONVERGE_TIMEOUT_MS = 2000L
         private const val CAPTURE_TIMEOUT_MS = 20000L
     }
 }
